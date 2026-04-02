@@ -1,0 +1,3 @@
+# Required for Tokio Console: exposes runtime task/resource tracing.
+[build]
+rustflags = ["--cfg", "tokio_unstable"]

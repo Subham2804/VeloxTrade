@@ -16,12 +16,12 @@ pub struct OrderRequest {
     pub price: f64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrdersRequest {
     pub orders: Vec<OrderRequest>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderResponse {
     /// Monotonic id from `AtomicU64`; matches global arrival sequence.
     pub order_id: u64,

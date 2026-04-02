@@ -8,6 +8,11 @@ use axum::{
     Router,
 };
 use crossbeam_channel::{bounded, Sender, TrySendError};
+use tower_http::trace::TraceLayer;
+use tracing::{info, warn};
+use tracing_subscriber::{
+    fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer as _,
+};
 use order_api::types::order::{
     order_response_from, validate, OrderResponse, OrdersRequest, QueuedOrder,
 };
@@ -23,45 +28,57 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
+    let log_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("order_api=info,tower_http=info,info")
+    });
+    tracing_subscriber::registry()
+        .with(console_subscriber::spawn())
+        .with(fmt::layer().with_filter(log_filter))
+        .init();
+
     let (order_tx, order_rx) = bounded(ORDER_QUEUE_CAPACITY);
 
     std::thread::spawn(move || {
         for _ in order_rx {}
     });
-
     let state = AppState {
         next_order_id: Arc::new(AtomicU64::new(0)),
         order_tx,
     };
-
     let app = Router::new()
         .route("/orders", post(post_orders))
+        .layer(TraceLayer::new_for_http())
         .with_state(state);
-
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
         .await
         .expect("bind port 3000");
-    println!("listening on http://{}", listener.local_addr().unwrap());
+    info!(addr = %listener.local_addr().unwrap(), "listening");
 
     axum::serve(listener, app).await.expect("server");
 }
 
 fn next_order_id(counter: &AtomicU64) -> u64 {
-    counter.fetch_add(1, Ordering::SeqCst) + 1
+    counter.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+#[tracing::instrument(skip(state, body))]
 async fn post_orders(
     State(state): State<AppState>,
     Json(body): Json<OrdersRequest>,
 ) -> Result<Json<Vec<OrderResponse>>, (StatusCode, String)> {
+    let order_count = body.orders.len();
     if body.orders.is_empty() {
+        warn!("reject empty batch");
         return Err((
             StatusCode::BAD_REQUEST,
             "orders must contain at least one entry".into(),
         ));
     }
     for o in &body.orders {
-        validate(o).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        validate(o).map_err(|e| {
+            warn!(error = %e, "validation failed");
+            (StatusCode::BAD_REQUEST, e)
+        })?;
     }
 
     let mut out = Vec::with_capacity(body.orders.len());
@@ -77,12 +94,14 @@ async fn post_orders(
         match state.order_tx.try_send(queued) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
+                warn!(order_id, "order queue full");
                 return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
                     "order queue is full; retry later".into(),
                 ));
             }
             Err(TrySendError::Disconnected(_)) => {
+                warn!("order queue disconnected");
                 return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
                     "order queue is unavailable".into(),
@@ -92,5 +111,6 @@ async fn post_orders(
         out.push(order_response_from(req, order_id, arrived_at_ms));
     }
 
+    info!(accepted = order_count, "batch enqueued");
     Ok(Json(out))
 }
